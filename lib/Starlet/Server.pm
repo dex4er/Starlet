@@ -1,6 +1,9 @@
 package Starlet::Server;
+
 use strict;
 use warnings;
+
+our $VERSION = '0.0101';
 
 use threads;
 
@@ -47,14 +50,15 @@ sub new {
             defined $args{err_respawn_interval}
                 ? $args{err_respawn_interval} : undef,
         ),
-        is_multiprocess      => Plack::Util::FALSE,
+        main_thread_delay    => $args{main_thread_delay} || 0.1,
+        is_multithread       => Plack::Util::FALSE,
         _using_defer_accept  => undef,
     }, $class;
 
     if ($args{max_workers} && $args{max_workers} > 1) {
         Carp::carp(
-            "Preforking in $class is deprecated. Falling back to the non-forking mode. ",
-            "If you need preforking, use Starman or Starlet instead and run like `plackup -s Starlet`",
+            "Threading in $class is deprecated. Falling back to the single thread mode. ",
+            "If you need more workers, use Starman, Starlet or Starlet instead and run like `plackup -s Starlet`",
         );
     }
 
@@ -101,7 +105,7 @@ sub accept_loop {
         # warn "server termination delayed while handling current HTTP request";
     };
 
-    local $SIG{PIPE} = 'IGNORE';
+    local $SIG{PIPE} = sub { 'IGNORE' };
 
     while (! defined $max_reqs_per_child || $proc_req_count < $max_reqs_per_child) {
         if (my $conn = $self->{listen_sock}->accept) {
@@ -124,8 +128,8 @@ sub accept_loop {
                     'psgi.errors'  => *STDERR,
                     'psgi.url_scheme' => 'http',
                     'psgi.run_once'     => Plack::Util::FALSE,
-                    'psgi.multithread'  => Plack::Util::FALSE,
-                    'psgi.multiprocess' => $self->{is_multiprocess},
+                    'psgi.multithread'  => $self->{is_multithread},
+                    'psgi.multiprocess' => Plack::Util::FALSE,
                     'psgi.streaming'    => Plack::Util::TRUE,
                     'psgi.nonblocking'  => Plack::Util::FALSE,
                     'psgix.input.buffered' => Plack::Util::TRUE,
@@ -149,10 +153,10 @@ sub accept_loop {
 
 sub handle_connection {
     my($self, $env, $conn, $app, $use_keepalive, $is_keepalive) = @_;
-    
+
     my $buf = '';
     my $res = [ 400, [ 'Content-Type' => 'text/plain' ], [ 'Bad Request' ] ];
-    
+
     local $self->{can_exit} = 1;
     while (1) {
         my $rlen = $self->read_timeout(
@@ -215,7 +219,7 @@ sub handle_connection {
     if ($self->{term_received}) {
         threads->exit;
     }
-    
+
     return $use_keepalive;
 }
 
@@ -224,7 +228,7 @@ sub _handle_response {
     my $status_code = $res->[0];
     my $headers = $res->[1];
     my $body = $res->[2];
-    
+
     my @lines;
     my %send_headers;
     for (my $i = 0; $i < @$headers; $i += 2) {
@@ -262,7 +266,7 @@ sub _handle_response {
     }
     unshift @lines, "HTTP/1.0 $status_code @{[ HTTP::Status::status_message($status_code) ]}\015\012";
     push @lines, "\015\012";
-    
+
     if (defined $body && ref $body eq 'ARRAY' && @$body == 1
             && length $body->[0] < 8192) {
         # combine response header and small request body
