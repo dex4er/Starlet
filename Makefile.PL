@@ -7,5 +7,6 @@ requires 'Plack' => 0.9920;
 
 test_requires 'Test::More' => 0.88;
 test_requires 'Test::TCP'  => 0.15;
+test_requires 'LWP::UserAgent' => 5.80;
 
 WriteAll;
