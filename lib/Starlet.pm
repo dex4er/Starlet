@@ -1,102 +1,79 @@
 package Starlet;
 
+use 5.008_001;
+
+our $VERSION = '0.21';
+
+1;
+__END__
+
 =head1 NAME
 
-Starlet - a simple PSGI/Plack HTTP server which uses threads
+Starlet - a simple, high-performance PSGI/Plack HTTP server
 
 =head1 SYNOPSIS
+
+  % start_server --port=80 -- plackup -s Starlet [options] your-app.psgi
+
+  or if you do not need hot deploy,
 
   % plackup -s Starlet --port=80 [options] your-app.psgi
 
 =head1 DESCRIPTION
 
-Starlet is a standalone HTTP/1.0 server with keep-alive support. It uses
-threads instead pre-forking, so it works correctly on Windows.
+Starlet is a standalone HTTP/1.1 web server, formerly known as L<Plack::Server::Standalone::Prefork> and L<Plack::Server::Standalone::Prefork::Server::Starter>.
 
-=for readme stop
+The server supports following features, and is suitable for running HTTP application servers behind a reverse proxy.
 
-=cut
+- prefork and graceful shutdown using L<Parallel::Prefork>
 
+- hot deploy using L<Server::Starter>
 
-use 5.008_001;
-
-use strict;
-use warnings;
-
-our $VERSION = '0.19';
-
-1;
-
-
-__END__
+- fast HTTP processing using L<HTTP::Parser::XS> (optional)
 
 =head1 COMMAND LINE OPTIONS
 
-In addition to the options supported by L<plackup>, Starlet accepts following
-options(s).
+In addition to the options supported by L<plackup>, Starlet accepts following options(s).
 
-=over
-
-=item --max-workers=#
+=head2 --max-workers=#
 
 number of worker processes (default: 10)
 
-=item --timeout=#
+=head2 --timeout=#
 
 seconds until timeout (default: 300)
 
-=item --keepalive-timeout=#
+=head2 --keepalive-timeout=#
 
 timeout for persistent connections (default: 2)
 
-=item --max-keepalive-reqs=#
+=head2 --max-keepalive-reqs=#
 
-max. number of requests allowed per single persistent connection.  If set to
-one, persistent connections are disabled (default: 1)
+max. number of requests allowed per single persistent connection.  If set to one, persistent connections are disabled (default: 1)
 
-=item --max-reqs-per-child=#
+=head2 --max-reqs-per-child=#
 
-max. number of requests to be handled before a worker process exits (default:
-100)
+max. number of requests to be handled before a worker process exits (default: 100)
 
-=item --min-reqs-per-child=#
+=head2 --min-reqs-per-child=#
 
-if set, randomizes the number of requests handled by a single worker process
-between the value and that supplied by C<--max-reqs-per-chlid> (default: none)
+if set, randomizes the number of requests handled by a single worker process between the value and that supplied by C<--max-reqs-per-chlid> (default: none)
 
-=item --spawn-interval=#
+=head2 --spawn-interval=#
 
-if set, worker processes will not be spawned more than once than every given
-seconds.  Also, when SIGHUP is being received, no more than one worker
-processes will be collected every given seconds.  This feature is useful for
-doing a "slow-restart". (default: none)
-
-=item --main-thread-delay=#
-
-the Starlet does not use signals or semaphores and it requires a small delay in
-main thread so it doesn't consume all CPU. (default: 0.1)
-
-=back
-
-=for readme continue
+if set, worker processes will not be spawned more than once than every given seconds.  Also, when SIGHUP is being received, no more than one worker processes will be collected every given seconds.  This feature is useful for doing a "slow-restart".  See http://blog.kazuhooku.com/2011/04/web-serverstarter-parallelprefork.html for more information. (dedault: none)
 
 =head1 NOTES
 
-Starlet was started as a fork of L<Starlet> server. It has almost the same code
-as L<Starlet> and it was adapted to use threads instead fork().
+L<Starlet> is designed and implemented to be simple, secure and fast, especially for running as a HTTP application server running behind a reverse proxy.  It only depends on a minimal number of well-designed (and well-focused) modules.
+
+On the other hand if you are looking for a standalone preforking HTTP server that receives HTTP requests directly from the Internet, then you should look at L<Starman>.
 
 =head1 SEE ALSO
 
-L<Starlet>,
+L<Parallel::Prefork>
 L<Starman>
-
-=head1 BUGS
-
-If you find the bug or want to implement new features, please report it at
-L<https://github.com/dex4er/Starlet/issues>
-
-The code repository is available at
-L<http://github.com/dex4er/Starlet>
+L<Server::Starter>
 
 =head1 AUTHOR
 
@@ -104,13 +81,12 @@ Kazuho Oku
 
 miyagawa
 
-Piotr Roszatycki <dexter@cpan.org>
+kazeburo
 
 =head1 LICENSE
 
-Copyright (c) 2013 Piotr Roszatycki <dexter@cpan.org>.
+This program is free software; you can redistribute it and/or modify it under the same terms as Perl itself.
 
-This is free software; you can redistribute it and/or modify it under
-the same terms as perl itself.
+See L<http://www.perl.com/perl/misc/Artistic.html>
 
-See L<http://dev.perl.org/licenses/artistic.html>
+=cut
