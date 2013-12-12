@@ -3,7 +3,10 @@ package Starlet::Server;
 use strict;
 use warnings;
 
-our $VERSION = '0.0101';
+our $VERSION = '0.0200';
+
+use Config;
+use if ! $Config{useithreads}, 'forks';
 
 use threads;
 
@@ -22,9 +25,9 @@ use Socket qw(IPPROTO_TCP TCP_NODELAY);
 use Try::Tiny;
 use Time::HiRes qw(time);
 
-use constant MAX_REQUEST_SIZE => 131072;
+use constant DEBUG            => $ENV{PERL_STARLET_DEBUG};
 use constant CHUNKSIZE        => 64 * 1024;
-use constant MSWin32          => $^O eq 'MSWin32';
+use constant MAX_REQUEST_SIZE => 131072;
 
 my $null_io = do { open my $io, "<", \""; $io }; #"
 
@@ -32,19 +35,26 @@ sub new {
     my($class, %args) = @_;
 
     my $self = bless {
-        host                 => $args{host} || 0,
-        port                 => $args{port} || 8080,
+        host                 => $args{host},
+        port                 => $args{port},
+        socket               => $args{socket},
+        listen               => $args{listen},
+        listen_sock          => $args{listen_sock},
         timeout              => $args{timeout} || 300,
         keepalive_timeout    => $args{keepalive_timeout} || 2,
         max_keepalive_reqs   => $args{max_keepalive_reqs} || 1,
-        server_software      => $args{server_software} || $class,
+        server_software      => $args{server_software} || "Starlet/$VERSION ($^O)",
         server_ready         => $args{server_ready} || sub {},
+        ssl                  => $args{ssl},
+        ipv6                 => $args{ipv6},
+        ssl_key_file         => $args{ssl_key_file},
+        ssl_cert_file        => $args{ssl_cert_file},
         min_reqs_per_child   => (
             defined $args{min_reqs_per_child}
                 ? $args{min_reqs_per_child} : undef,
         ),
         max_reqs_per_child   => (
-            $args{max_reqs_per_child} || $args{max_requests} || 100,
+            $args{max_reqs_per_child} || $args{max_requests} || 1000,
         ),
         spawn_interval       => $args{spawn_interval} || 0,
         err_respawn_interval => (
@@ -52,7 +62,12 @@ sub new {
                 ? $args{err_respawn_interval} : undef,
         ),
         main_thread_delay    => $args{main_thread_delay} || 0.1,
+        thread_stack_size    => (
+            defined $args{thread_stack_size}
+                ? $args{thread_stack_size} : undef,
+        ),
         is_multithread       => Plack::Util::FALSE,
+        is_multiprocess      => Plack::Util::FALSE,
         _using_defer_accept  => undef,
     }, $class;
 
@@ -72,15 +87,57 @@ sub run {
     $self->accept_loop($app);
 }
 
+sub prepare_socket_class {
+    my($self, $args) = @_;
+
+    if ($self->{socket} and ($self->{ssl} or $self->{ipv6})) {
+        Carp::croak("UNIX socket and either SSL or IPv6 are not supported at the same time. Choose one.");
+    }
+
+    if ($self->{ssl} and $self->{ipv6}) {
+        Carp::croak("SSL and IPv6 are not supported at the same time (yet). Choose one.");
+    }
+
+    if ($self->{socket}) {
+        try { require IO::Socket::UNIX; 1 }
+            or Carp::croak("UNIX socket suport requires IO::Socket::UNIX");
+        $args->{Local} =~ s/^@/\0/; # abstract socket address
+        return "IO::Socket::UNIX";
+    } elsif ($self->{ssl}) {
+        try { require IO::Socket::SSL; 1 }
+            or Carp::croak("SSL suport requires IO::Socket::SSL");
+        $args->{SSL_key_file}  = $self->{ssl_key_file};
+        $args->{SSL_cert_file} = $self->{ssl_cert_file};
+        return "IO::Socket::SSL";
+    } elsif ($self->{ipv6}) {
+        try { require IO::Socket::IP; 1 }
+            or Carp::croak("IPv6 support requires IO::Socket::IP");
+        $self->{host}      ||= '::';
+        $args->{LocalAddr} ||= '::';
+        return "IO::Socket::IP";
+    }
+
+    return "IO::Socket::INET";
+}
+
 sub setup_listener {
-    my $self = shift;
-    $self->{listen_sock} ||= IO::Socket::INET->new(
-        Listen    => SOMAXCONN,
-        LocalPort => $self->{port},
-        LocalAddr => $self->{host},
+    my ($self) = @_;
+
+    my %args = $self->{socket} ? (
+        Listen    => Socket::SOMAXCONN,
+        Local     => $self->{socket},
+    ) : (
+        Listen    => Socket::SOMAXCONN,
+        LocalPort => $self->{port} || 5000,
+        LocalAddr => $self->{host} || 0,
         Proto     => 'tcp',
         ReuseAddr => 1,
-    ) or die "failed to listen to port $self->{port}:$!";
+    );
+
+    my $class = $self->prepare_socket_class(\%args);
+    $self->{listen_sock} ||= $class->new(%args)
+        or die sprintf "failed to listen to %s: $!", $self->{socket}
+            ? "socket $self->{socket}" : "port $self->{port}";
 
     my $family = Socket::sockaddr_family(getsockname($self->{listen_sock}));
     $self->{_listen_sock_is_tcp} = $family != AF_UNIX;
@@ -91,7 +148,7 @@ sub setup_listener {
             and $self->{_using_defer_accept} = 1;
     }
 
-    $self->{server_ready}->($self);
+    $self->{server_ready}->({ %$self, proto => $self->{ssl} ? 'https' : 'http' });
 }
 
 sub accept_loop {
@@ -101,17 +158,11 @@ sub accept_loop {
 
     $self->{can_exit} = 1;
     my $is_keepalive = 0;
-    local $SIG{TERM} = sub {
-        threads->exit if $self->{can_exit};
-        $self->{term_received}++;
-        threads->exit
-            if ($is_keepalive && $self->{can_exit}) || $self->{term_received} > 1;
-        # warn "server termination delayed while handling current HTTP request";
-    };
 
     local $SIG{PIPE} = sub { 'IGNORE' };
 
     while (! defined $max_reqs_per_child || $proc_req_count < $max_reqs_per_child) {
+        threads->yield;
         if (my ($conn,$peer) = $self->{listen_sock}->accept) {
             $self->{_is_deferred_accept} = $self->{_using_defer_accept};
             $conn->blocking(0)
@@ -120,32 +171,38 @@ sub accept_loop {
             if ($self->{_listen_sock_is_tcp}) {
                 $conn->setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)
                     or die "setsockopt(TCP_NODELAY) failed:$!";
-                ($peerport, $peerhost) = unpack_sockaddr_in $peer;
-                $peeraddr = inet_ntoa($peerhost);
+                my $family = Socket::sockaddr_family(getsockname($self->{listen_sock}));
+                local $@;
+                if (try { $family == AF_INET6 }) {
+                    ($peerport, $peerhost) = Socket::unpack_sockaddr_in6($peer);
+                    $peeraddr = Socket::inet_ntop($family, $peerhost);
+                } else {
+                    ($peerport, $peerhost) = Socket::unpack_sockaddr_in($peer);
+                    $peeraddr = Socket::inet_ntoa($peerhost);
+                }
             }
             my $req_count = 0;
             my $pipelined_buf = '';
-
             while (1) {
                 ++$req_count;
                 ++$proc_req_count;
                 my $env = {
                     SERVER_PORT => $self->{port} || 0,
-                    SERVER_NAME => $self->{host} || 0,
+                    SERVER_NAME => $self->{host} || '*',
                     SCRIPT_NAME => '',
                     REMOTE_ADDR => $peeraddr,
                     REMOTE_PORT => $peerport,
                     'psgi.version' => [ 1, 1 ],
                     'psgi.errors'  => *STDERR,
-                    'psgi.url_scheme' => 'http',
+                    'psgi.url_scheme'   => $self->{ssl} ? 'https' : 'http',
                     'psgi.run_once'     => Plack::Util::FALSE,
                     'psgi.multithread'  => $self->{is_multithread},
-                    'psgi.multiprocess' => Plack::Util::FALSE,
+                    'psgi.multiprocess' => $self->{is_multiprocess},
                     'psgi.streaming'    => Plack::Util::TRUE,
                     'psgi.nonblocking'  => Plack::Util::FALSE,
                     'psgix.input.buffered' => Plack::Util::TRUE,
                     'psgix.io'          => $conn,
-                    'psgix.harakiri'    => 1,
+                    'psgix.harakiri'    => Plack::Util::TRUE,
                 };
 
                 my $may_keepalive = $req_count < $self->{max_keepalive_reqs};
@@ -154,7 +211,7 @@ sub accept_loop {
                 }
                 $may_keepalive = 1 if length $pipelined_buf;
                 my $keepalive;
-                ($keepalive, $pipelined_buf) = $self->handle_connection($env, $conn, $app, 
+                ($keepalive, $pipelined_buf) = $self->handle_connection($env, $conn, $app,
                                                                         $may_keepalive, $req_count != 1, $pipelined_buf);
 
                 if ($env->{'psgix.harakiri.commit'}) {
@@ -172,11 +229,11 @@ sub accept_loop {
 my $bad_response = [ 400, [ 'Content-Type' => 'text/plain', 'Connection' => 'close' ], [ 'Bad Request' ] ];
 sub handle_connection {
     my($self, $env, $conn, $app, $use_keepalive, $is_keepalive, $prebuf) = @_;
-    
+
     my $buf = '';
     my $pipelined_buf='';
     my $res = $bad_response;
-    
+
     local $self->{can_exit} = (defined $prebuf) ? 0 : 1;
     while (1) {
         my $rlen;
@@ -198,7 +255,7 @@ sub handle_connection {
             if ($use_keepalive) {
                 if ( $protocol eq 'HTTP/1.1' ) {
                     if (my $c = $env->{HTTP_CONNECTION}) {
-                        $use_keepalive = undef 
+                        $use_keepalive = undef
                             if $c =~ /^\s*close\s*/i;
                     }
                 }
@@ -257,7 +314,7 @@ sub handle_connection {
                         }
                         $buffer->print(substr $chunk_buffer, 0, $chunk_len, '');
                         $chunk_buffer =~ s/^\015\012//;
-                        $length += $chunk_len;                        
+                        $length += $chunk_len;
                     }
                 }
                 $env->{CONTENT_LENGTH} = $length;
@@ -301,9 +358,9 @@ sub handle_connection {
         die "Bad response $res";
     }
     if ($self->{term_received}) {
-        exit 0;
+        threads->exit;
     }
-    
+
     return ($use_keepalive, $pipelined_buf);
 }
 
@@ -348,7 +405,7 @@ sub _handle_response {
             }
             else {
                 $$use_keepalive_r = undef
-            }            
+            }
         }
         push @lines, "Connection: keep-alive\015\012" if $$use_keepalive_r;
         push @lines, "Connection: close\015\012" if !$$use_keepalive_r; #fmm..
